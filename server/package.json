@@ -1,0 +1,25 @@
+{
+  "name": "veil-server",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/relay.ts",
+  "scripts": {
+    "dev": "tsx watch src/relay.ts",
+    "server": "tsx watch src/relay.ts",
+    "build": "tsc",
+    "start": "node dist/relay.js"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.1",
+    "ioredis-mock": "^8.13.1",
+    "libsodium": "^0.8.4",
+    "libsodium-wrappers": "^0.7.15",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.10",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  }
+}

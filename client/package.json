@@ -1,0 +1,43 @@
+{
+  "name": "client",
+  "version": "1.0.0",
+  "main": "index.js",
+  "op-sqlite": {
+    "sqlcipher": true
+  },
+  "dependencies": {
+    "@expo/metro-runtime": "~57.0.15",
+    "@op-engineering/op-sqlite": "^18.1.4",
+    "@react-navigation/native": "^7.3.18",
+    "@react-navigation/stack": "^7.10.24",
+    "expo": "~57.0.20",
+    "expo-blur": "~57.0.2",
+    "expo-linear-gradient": "~57.0.1",
+    "expo-screen-capture": "~57.0.2",
+    "expo-secure-store": "~57.0.3",
+    "expo-status-bar": "~57.0.1",
+    "libsodium-wrappers": "^0.8.4",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-gesture-handler": "~2.32.0",
+    "react-native-get-random-values": "^2.0.0",
+    "react-native-haptic-feedback": "^3.0.0",
+    "react-native-reanimated": "4.5.1",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-svg": "15.15.4",
+    "react-native-web": "^0.21.2"
+  },
+  "devDependencies": {
+    "@types/libsodium-wrappers": "^0.7.14",
+    "@types/react": "~19.2.2",
+    "typescript": "~6.0.3"
+  },
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "web": "expo start --web"
+  },
+  "private": true
+}
