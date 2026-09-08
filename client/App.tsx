@@ -4,7 +4,7 @@ import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { ChatScreen } from './src/screens/ChatScreen';
-import { initCrypto } from './src/crypto/keys';
+import { initCrypto, deriveVaultKey } from './src/crypto/keys';
 import { insertMessage, listMessages, type StoredMessage } from './src/storage/db';
 import { Palette } from './src/theme/obsidianPrism';
 
@@ -12,6 +12,10 @@ export default function App() {
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
+    console.time('argon2');
+    deriveVaultKey('123456', new Uint8Array(16).fill(7), 'partition.primary');
+    console.timeEnd('argon2');
+
     let mounted = true;
     (async () => {
       try {

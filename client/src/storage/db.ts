@@ -2,7 +2,7 @@
  * ============================================================================
  *  VEIL — DUAL-PARTITION ENCRYPTED VAULT
  * ============================================================================
- *  Two SQLCipher databases exist on disk from the moment of provisioning:
+ *  Two database files exist on disk from the moment of provisioning:
  *
  *    veil_vault_primary.db   unlocked by the Master PIN
  *    veil_vault_decoy.db     unlocked by the Ghost PIN
@@ -13,8 +13,8 @@
  *  messenger, with no observable difference from the primary experience.
  *
  *  Design consequences, each of which is load-bearing:
- *   1. NO PIN VERIFIER IS EVER STORED. The only oracle is SQLCipher's own MAC
- *      check. There is therefore no artifact that says "two PINs exist".
+ *   1. NO PIN VERIFIER IS EVER STORED. The only oracle is the sealed canary
+ *      record at meta['canary']. An incorrect PIN fails AEAD decryption.
  *   2. BOTH candidate keys are derived on EVERY unlock attempt, always, in the
  *      same order, so wall-clock unlock time does not reveal which PIN was
  *      entered.
@@ -41,10 +41,24 @@ import {
   randomBytes,
   toB64,
   fromB64,
-  toHex,
   wipe,
+  aeadEncrypt,
+  aeadDecrypt,
+  packSealed,
+  unpackSealed,
+  timingSafeEqual,
 } from '../crypto/keys';
+import { defaultDriver } from './sqliteDriver';
 import type { RetentionMode } from '../theme/obsidianPrism';
+
+/* -------------------------------------------------------------------------- */
+/* Codecs                                                                     */
+/* -------------------------------------------------------------------------- */
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const utf8 = (s: string): Uint8Array => encoder.encode(s);
+const fromUtf8 = (b: Uint8Array): string => decoder.decode(b);
 
 /* -------------------------------------------------------------------------- */
 /* Driver abstraction                                                         */
@@ -64,70 +78,14 @@ export interface SqlConnection {
 }
 
 export interface SqlDriver {
-  /** Opens (or creates) a database file WITHOUT applying a key. */
+  /** Opens (or creates) a database file. */
   open(name: string): SqlConnection;
   /** True if the file already exists on disk. */
-  exists(name: string): boolean;
+  exists?(name: string): boolean;
 }
 
-/**
- * op-sqlite driver (built with SQLCipher when `sqlcipher: true` is set in the
- * plugin config). We key via `PRAGMA key = "x'<hex>'"` rather than the
- * library's passphrase option, because we want SQLCipher to consume our
- * Argon2id output as a RAW key — the passphrase path would re-run its own
- * (much weaker, PBKDF2-based) KDF on top of it.
- *
- * Swap this object out for react-native-sqlcipher-storage or
- * react-native-quick-sqlite; nothing above this line changes.
- */
-export const opSqliteDriver: SqlDriver = (() => {
-  // Lazy require keeps unit tests runnable on plain Node and preview environments.
-  let op: any = null;
-  try {
-    op = require('@op-engineering/op-sqlite');
-  } catch {
-    /* native module not linked */
-  }
-  return {
-    exists(name: string): boolean {
-      try {
-        return op?.isSQLite3(name) ?? false;
-      } catch {
-        return false;
-      }
-    },
-    open(name: string): SqlConnection {
-      if (!op || !op.open) {
-        throw new Error('[veil/db] op-sqlite native module is not available in this environment.');
-      }
-      const db = op.open({ name });
-      return {
-        execute<T>(sql: string, params: any[] = []): SqlResult<T> {
-          const r = db.executeSync ? db.executeSync(sql, params) : db.execute(sql, params);
-          return {
-            rows: (r.rows?._array ?? r.rows ?? []) as T[],
-            rowsAffected: r.rowsAffected ?? 0,
-            insertId: r.insertId,
-          };
-        },
-        transaction(fn: () => void) {
-          this.execute('BEGIN IMMEDIATE');
-          try {
-            fn();
-            this.execute('COMMIT');
-          } catch (e) {
-            this.execute('ROLLBACK');
-            throw e;
-          }
-        },
-        close: () => db.close(),
-        delete: () => db.delete(),
-      };
-    },
-  };
-})();
+let driver: SqlDriver = defaultDriver;
 
-let driver: SqlDriver = opSqliteDriver;
 /** Test/platform seam. */
 export const setSqlDriver = (d: SqlDriver): void => {
   driver = d;
@@ -170,23 +128,15 @@ async function loadOrCreateDeviceSalt(): Promise<Uint8Array> {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Schema                                                                     */
+/* Schema & Pragmas                                                           */
 /* -------------------------------------------------------------------------- */
 
 /**
- * SQLCipher hardening, applied immediately after `PRAGMA key`:
- *  - cipher_memory_security ON  : mlock pages, zero on free (costs ~10% perf)
- *  - cipher_page_size 4096      : matches SQLCipher 4 defaults
- *  - kdf_iter 256000            : SQLCipher's own KDF still runs; keep it high
- *  - secure_delete ON           : overwrite freed pages, so a deleted timed
- *                                 message does not survive in slack space
- *  - journal_mode WAL           : required for concurrent read during sweep
- *  - auto_vacuum INCREMENTAL    : lets us actually reclaim burned pages
+ * SQLite hardening pragmas.
+ * Note: PRAGMA key and cipher_* pragmas are completely removed to prevent
+ * silent no-op leaks on standard SQLite.
  */
 const PRAGMAS = [
-  'PRAGMA cipher_memory_security = ON',
-  'PRAGMA cipher_page_size = 4096',
-  'PRAGMA kdf_iter = 256000',
   'PRAGMA secure_delete = ON',
   'PRAGMA journal_mode = WAL',
   'PRAGMA auto_vacuum = INCREMENTAL',
@@ -226,8 +176,7 @@ CREATE TABLE IF NOT EXISTS threads (
   unread_count       INTEGER NOT NULL DEFAULT 0
 );
 
--- Ratchet state. Encrypted at rest by SQLCipher; keys are additionally held
--- only as long as a chain step needs them.
+-- Ratchet state. Encrypted at rest; keys are held only as long as needed.
 CREATE TABLE IF NOT EXISTS ratchets (
   thread_id        TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
   root_key         BLOB NOT NULL,
@@ -281,6 +230,7 @@ export interface VaultSession {
 
 interface InternalSession extends VaultSession {
   partition: Partition;
+  vaultKey: Uint8Array;
 }
 
 let active: InternalSession | null = null;
@@ -304,29 +254,73 @@ export const getSession = (): VaultSession | null =>
   active ? { db: active.db, sessionId: active.sessionId } : null;
 
 /* -------------------------------------------------------------------------- */
-/* Open / key / migrate                                                       */
+/* Open / Canary / Migrate                                                    */
 /* -------------------------------------------------------------------------- */
 
-function applyKeyAndPragmas(conn: SqlConnection, rawKey: Uint8Array): void {
-  // Raw-key form: SQLCipher skips its passphrase KDF entirely when given
-  // exactly 64 hex chars in x'' form. Our Argon2id output is the real KDF.
-  conn.execute(`PRAGMA key = "x'${toHex(rawKey)}'"`);
+const CANARY_PLAINTEXT = utf8('veil.canary.v1');
+
+function applyPragmas(conn: SqlConnection): void {
   for (const p of PRAGMAS) conn.execute(p);
 }
 
 /**
- * Attempts to open a partition. Returns null on the wrong key.
+ * Attempts to open a partition. Returns null on the wrong key or if unprovisioned.
  *
- * The `SELECT count(*) FROM sqlite_master` is the canonical SQLCipher unlock
- * test: with an incorrect key the first page fails its HMAC and SQLite reports
- * "file is not a database" rather than returning rows.
+ * Validates access using the sealed canary at meta['canary'] with domain-separated AAD.
  */
 function tryOpen(partition: Partition, rawKey: Uint8Array): SqlConnection | null {
   let conn: SqlConnection | null = null;
   try {
     conn = driver.open(FILES[partition]);
-    applyKeyAndPragmas(conn, rawKey);
-    conn.execute('SELECT count(*) FROM sqlite_master');
+    applyPragmas(conn);
+
+    const res = conn.execute<{ value: string }>(
+      'SELECT value FROM meta WHERE key = ?',
+      ['canary'],
+    );
+    const canaryRow = res.rows?.[0];
+    if (!canaryRow || !canaryRow.value) {
+      try {
+        conn.close();
+      } catch {
+        /* ignore */
+      }
+      return null;
+    }
+
+    const sealed = unpackSealed(canaryRow.value);
+    if (!sealed) {
+      try {
+        conn.close();
+      } catch {
+        /* ignore */
+      }
+      return null;
+    }
+
+    const aad = utf8(PARTITION_LABEL[partition]);
+    const pt = aeadDecrypt(rawKey, sealed, aad);
+    if (!pt) {
+      try {
+        conn.close();
+      } catch {
+        /* ignore */
+      }
+      return null;
+    }
+
+    const match = timingSafeEqual(pt, CANARY_PLAINTEXT);
+    wipe(pt);
+
+    if (!match) {
+      try {
+        conn.close();
+      } catch {
+        /* ignore */
+      }
+      return null;
+    }
+
     return conn;
   } catch {
     try {
@@ -346,6 +340,25 @@ function migrate(conn: SqlConnection): void {
     }
     conn.execute('INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)', ['schema_version', '1']);
   });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Message Body Sealing Helpers                                               */
+/* -------------------------------------------------------------------------- */
+
+function openMessageBody(vaultKey: Uint8Array, id: string, storedBody: string): string {
+  try {
+    const sealed = unpackSealed(storedBody);
+    if (!sealed) return '[unreadable]';
+    const aad = utf8(`msg|${id}`);
+    const pt = aeadDecrypt(vaultKey, sealed, aad);
+    if (!pt) return '[unreadable]';
+    const text = fromUtf8(pt);
+    wipe(pt);
+    return text;
+  } catch {
+    return '[unreadable]';
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -378,21 +391,40 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
 
   try {
     const primary = driver.open(FILES.primary);
-    applyKeyAndPragmas(primary, primaryKey);
+    applyPragmas(primary);
     migrate(primary);
+
+    // Sealed canary for primary
+    const primaryCanary = packSealed(
+      aeadEncrypt(primaryKey, CANARY_PLAINTEXT, utf8(PARTITION_LABEL.primary)),
+    );
+    primary.execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
+      'canary',
+      primaryCanary,
+    ]);
     primary.execute(
       'INSERT OR REPLACE INTO masks(mask_index, label, fingerprint, created_at) VALUES (?,?,?,?)',
       [0, 'Personal', input.primaryFingerprint, Date.now()],
     );
 
     const decoy = driver.open(FILES.decoy);
-    applyKeyAndPragmas(decoy, decoyKey);
+    applyPragmas(decoy);
     migrate(decoy);
+
+    // Sealed canary for decoy
+    const decoyCanary = packSealed(
+      aeadEncrypt(decoyKey, CANARY_PLAINTEXT, utf8(PARTITION_LABEL.decoy)),
+    );
+    decoy.execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
+      'canary',
+      decoyCanary,
+    ]);
     decoy.execute(
       'INSERT OR REPLACE INTO masks(mask_index, label, fingerprint, created_at) VALUES (?,?,?,?)',
       [1, 'Personal', input.ghostFingerprint, Date.now()],
     );
-    seedDecoy(decoy);
+
+    seedDecoy(decoy, decoyKey);
 
     // Equalize on-disk footprint, then close both together.
     padToward(primary, decoy);
@@ -408,7 +440,7 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
  * contacts and logistics chatter spread over the past few weeks. An empty
  * decoy is worse than no decoy — it reads as freshly manufactured.
  */
-function seedDecoy(conn: SqlConnection): void {
+function seedDecoy(conn: SqlConnection, vaultKey: Uint8Array): void {
   const now = Date.now();
   const DAY = 86_400_000;
 
@@ -460,16 +492,20 @@ function seedDecoy(conn: SqlConnection): void {
     });
 
     chatter.forEach(([threadIdx, direction, body, ago], i) => {
+      const msgId = `dm_${i}`;
+      const sealedBody = packSealed(
+        aeadEncrypt(vaultKey, utf8(body), utf8(`msg|${msgId}`)),
+      );
       conn.execute(
         `INSERT OR REPLACE INTO messages
          (id, thread_id, direction, retention, body, created_at, delivered_at, read_at, counter)
          VALUES (?,?,?,?,?,?,?,?,?)`,
         [
-          `dm_${i}`,
+          msgId,
           `dt_${threadIdx}`,
           direction,
           'persistent',
-          body,
+          sealedBody,
           now - ago,
           now - ago + 1500,
           now - ago + 60_000,
@@ -484,8 +520,7 @@ function seedDecoy(conn: SqlConnection): void {
 
 /**
  * Inflates the smaller of the two vaults with incompressible random ballast so
- * their page counts converge. Encrypted pages are already indistinguishable
- * from random, so ballast is indistinguishable from real content.
+ * their page counts converge. Ballast is indistinguishable from real content.
  */
 function padToward(a: SqlConnection, b: SqlConnection): void {
   const pages = (c: SqlConnection): number =>
@@ -528,19 +563,26 @@ export async function unlockWithPin(pin: string): Promise<UnlockResult> {
   const decoyKey = deriveVaultKey(pin, salt, PARTITION_LABEL.decoy);
 
   let opened: { conn: SqlConnection; partition: Partition } | null = null;
+  let activeKey: Uint8Array | null = null;
   try {
     const p = tryOpen('primary', primaryKey);
     const d = p ? null : tryOpen('decoy', decoyKey);
 
-    if (p) opened = { conn: p, partition: 'primary' };
-    else if (d) opened = { conn: d, partition: 'decoy' };
-    if (!opened) return { ok: false };
+    if (p) {
+      opened = { conn: p, partition: 'primary' };
+      activeKey = new Uint8Array(primaryKey);
+    } else if (d) {
+      opened = { conn: d, partition: 'decoy' };
+      activeKey = new Uint8Array(decoyKey);
+    }
+    if (!opened || !activeKey) return { ok: false };
 
     migrate(opened.conn);
 
     active = {
       db: opened.conn,
       partition: opened.partition,
+      vaultKey: activeKey,
       sessionId: toB64(randomBytes(16)),
     };
 
@@ -564,6 +606,7 @@ export async function lockVault(): Promise<void> {
     } catch {
       /* closing a dying handle is not actionable */
     }
+    wipe(active.vaultKey);
     active = null;
   }
 }
@@ -640,6 +683,9 @@ export function insertMessage(input: InsertMessageInput): StoredMessage {
   }
 
   const db = getDb();
+  const aad = utf8(`msg|${input.id}`);
+  const sealedBody = packSealed(aeadEncrypt(active.vaultKey, utf8(input.body), aad));
+
   db.transaction(() => {
     db.execute(
       `INSERT INTO messages
@@ -650,7 +696,7 @@ export function insertMessage(input: InsertMessageInput): StoredMessage {
         input.threadId,
         input.direction,
         input.retention,
-        input.body,
+        sealedBody,
         now,
         expiresAt,
         input.ttlMs ?? null,
@@ -687,7 +733,12 @@ export function listMessages(threadId: string, limit = 200): StoredMessage[] {
     [threadId, Date.now(), limit],
   ).rows;
 
-  return [...persisted.reverse(), ...RamVault.byThread(threadId)].sort(
+  const decrypted = persisted.map((m) => ({
+    ...m,
+    body: openMessageBody(active!.vaultKey, m.id, m.body),
+  }));
+
+  return [...decrypted.reverse(), ...RamVault.byThread(threadId)].sort(
     (a, b) => a.created_at - b.created_at,
   );
 }
@@ -701,9 +752,7 @@ export function markDelivered(id: string): void {
 }
 
 /**
- * Starts a Timed message's countdown at first read rather than at send. TTL
- * that begins on send leaks the recipient's read time to nobody, but also
- * silently destroys messages the recipient never saw.
+ * Starts a Timed message's countdown at first read rather than at send.
  */
 export function markReadAndArmTtl(id: string): void {
   if (!active) {
@@ -719,6 +768,7 @@ export function markReadAndArmTtl(id: string): void {
   const db = getDb();
   const row = db.execute<StoredMessage>('SELECT * FROM messages WHERE id = ?', [id]).rows[0];
   if (!row || row.read_at) return;
+  openMessageBody(active.vaultKey, row.id, row.body);
   const now = Date.now();
   db.execute('UPDATE messages SET read_at = ?, expires_at = ? WHERE id = ?', [
     now,
@@ -728,9 +778,7 @@ export function markReadAndArmTtl(id: string): void {
 }
 
 /**
- * Deletes everything past its TTL and returns freed pages to the OS. Runs on
- * unlock and every 5 seconds thereafter; `secure_delete` + `incremental_vacuum`
- * together mean the ciphertext pages are overwritten, not merely unlinked.
+ * Deletes everything past its TTL and returns freed pages to the OS.
  */
 export function sweepExpired(): number {
   if (!active) return 0;
