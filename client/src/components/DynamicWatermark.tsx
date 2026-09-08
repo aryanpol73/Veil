@@ -38,11 +38,10 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AppState, InteractionManager, StyleSheet, View } from 'react-native';
+import { AppState, InteractionManager, Platform, StyleSheet, View } from 'react-native';
 import Svg, { G, Path, Rect } from 'react-native-svg';
 import Animated, {
   Easing,
-  useAnimatedProps,
   useAnimatedStyle,
   useSharedValue,
   withRepeat,
@@ -53,8 +52,6 @@ import * as ScreenCapture from 'expo-screen-capture';
 import HapticFeedback from 'react-native-haptic-feedback';
 import { watermarkTag, toB64 } from '../crypto/keys';
 import { Palette, withAlpha } from '../theme/obsidianPrism';
-
-const AnimatedG = Animated.createAnimatedComponent(G);
 
 /* -------------------------------------------------------------------------- */
 
@@ -221,10 +218,12 @@ export const DynamicWatermark: React.FC<DynamicWatermarkProps> = ({
     );
   }, [drift]);
 
-  const animatedGroupProps = useAnimatedProps(() => ({
+  const driftStyle = useAnimatedStyle(() => ({
     // Keep the drift under one pitch so the lattice stays phase-continuous.
-    translateX: drift.value * 1.7,
-    translateY: drift.value * -1.1,
+    transform: [
+      { translateX: drift.value * 1.7 },
+      { translateY: drift.value * -1.1 },
+    ],
   }));
 
   const flashStyle = useAnimatedStyle(() => ({
@@ -238,10 +237,16 @@ export const DynamicWatermark: React.FC<DynamicWatermarkProps> = ({
         withTiming(1, { duration: 700 }),
         withTiming(0, { duration: 900, easing: Easing.out(Easing.quad) }),
       );
-      HapticFeedback.trigger('notificationWarning', {
-        enableVibrateFallback: true,
-        ignoreAndroidSystemSettings: false,
-      });
+      if (Platform.OS !== 'web') {
+        try {
+          HapticFeedback.trigger('notificationWarning', {
+            enableVibrateFallback: true,
+            ignoreAndroidSystemSettings: false,
+          });
+        } catch {
+          /* ignore */
+        }
+      }
       onCaptureDetected?.(kind);
     },
     [flash, onCaptureDetected],
@@ -253,40 +258,57 @@ export const DynamicWatermark: React.FC<DynamicWatermarkProps> = ({
     let disposed = false;
     const subs: Array<{ remove: () => void }> = [];
 
-    (async () => {
-      // Android: FLAG_SECURE genuinely prevents the screenshot and blanks the
-      // recents thumbnail. iOS has no equivalent; detection is all we get.
-      if (blockCaptureOnAndroid) {
-        try {
-          await ScreenCapture.preventScreenCaptureAsync('veil-chat');
-        } catch {
-          /* unsupported platform — carrier + detection still apply */
-        }
-      }
-      if (disposed) return;
-
-      subs.push(ScreenCapture.addScreenshotListener(() => triggerFlash('screenshot')));
-
-      // Screen recording / AirPlay mirroring (iOS UIScreen.isCaptured).
-      if (typeof (ScreenCapture as any).isAvailableAsync === 'function') {
-        let wasCaptured = false;
-        const poll = setInterval(async () => {
+    if (Platform.OS !== 'web') {
+      (async () => {
+        // Android: FLAG_SECURE genuinely prevents the screenshot and blanks the
+        // recents thumbnail. iOS has no equivalent; detection is all we get.
+        if (blockCaptureOnAndroid && Platform.OS === 'android') {
           try {
-            const captured = await (ScreenCapture as any).isScreenBeingRecordedAsync?.();
-            if (captured && !wasCaptured) triggerFlash('recording');
-            wasCaptured = !!captured;
+            await ScreenCapture.preventScreenCaptureAsync('veil-chat');
           } catch {
-            clearInterval(poll);
+            /* unsupported platform — carrier + detection still apply */
           }
-        }, 2000);
-        subs.push({ remove: () => clearInterval(poll) });
-      }
-    })();
+        }
+        if (disposed) return;
+
+        try {
+          if (typeof ScreenCapture.addScreenshotListener === 'function') {
+            const sub = ScreenCapture.addScreenshotListener(() => triggerFlash('screenshot'));
+            if (sub && typeof sub.remove === 'function') {
+              subs.push(sub);
+            }
+          }
+        } catch {
+          /* unsupported on current platform */
+        }
+
+        // Screen recording / AirPlay mirroring (iOS UIScreen.isCaptured).
+        if (typeof (ScreenCapture as any).isAvailableAsync === 'function') {
+          let wasCaptured = false;
+          const poll = setInterval(async () => {
+            try {
+              const captured = await (ScreenCapture as any).isScreenBeingRecordedAsync?.();
+              if (captured && !wasCaptured) triggerFlash('recording');
+              wasCaptured = !!captured;
+            } catch {
+              clearInterval(poll);
+            }
+          }, 2000);
+          subs.push({ remove: () => clearInterval(poll) });
+        }
+      })();
+    }
 
     return () => {
       disposed = true;
       subs.forEach((s) => s.remove());
-      ScreenCapture.allowScreenCaptureAsync('veil-chat').catch(() => {});
+      if (Platform.OS !== 'web') {
+        try {
+          ScreenCapture.allowScreenCaptureAsync('veil-chat').catch(() => {});
+        } catch {
+          /* ignore */
+        }
+      }
     };
   }, [blockCaptureOnAndroid, triggerFlash]);
 
@@ -310,26 +332,28 @@ export const DynamicWatermark: React.FC<DynamicWatermarkProps> = ({
       }}
     >
       {size.w > 0 && (
-        <Svg width={size.w} height={size.h}>
-          {/* Faint chromatic wash: makes the lattice survive greyscale
-              conversion and adds a second, color-channel-based carrier. */}
-          <Rect
-            x={0}
-            y={0}
-            width={size.w}
-            height={size.h}
-            fill={withAlpha(Palette.prismCyan, 0.02)}
-          />
-          <AnimatedG animatedProps={animatedGroupProps}>
-            <Path
-              d={pathData}
-              stroke={Palette.textPrimary}
-              strokeWidth={0.7}
-              strokeLinecap="butt"
-              fill="none"
+        <Animated.View style={driftStyle}>
+          <Svg width={size.w} height={size.h}>
+            {/* Faint chromatic wash: makes the lattice survive greyscale
+                conversion and adds a second, color-channel-based carrier. */}
+            <Rect
+              x={0}
+              y={0}
+              width={size.w}
+              height={size.h}
+              fill={withAlpha(Palette.prismCyan, 0.02)}
             />
-          </AnimatedG>
-        </Svg>
+            <G>
+              <Path
+                d={pathData}
+                stroke={Palette.textPrimary}
+                strokeWidth={0.7}
+                strokeLinecap="butt"
+                fill="none"
+              />
+            </G>
+          </Svg>
+        </Animated.View>
       )}
 
       {/* Human-readable tag echo, corner-anchored, same carrier opacity. */}

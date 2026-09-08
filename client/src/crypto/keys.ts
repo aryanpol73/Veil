@@ -1,50 +1,38 @@
 /**
  * ============================================================================
- *  VEIL — CRYPTOGRAPHIC CORE
+ *  VEIL — CRYPTOGRAPHIC CORE (@noble implementation)
  * ============================================================================
  *  Identity is a keypair, nothing else. No phone number, no email, no
  *  server-side directory, no account recovery. Losing the master seed is
  *  losing the identity — that is the product, not a bug.
  *
- *  Primitives (all libsodium):
- *    Ed25519  crypto_sign          — invitations, inbox authorization tokens
- *    X25519   crypto_kx / scalarmult — ECDH for the ratchet
- *    BLAKE2b  crypto_generichash   — domain-separated KDF, fingerprints,
- *                                    blinded inbox IDs
- *    XChaCha20-Poly1305            — payload AEAD (24-byte random nonce)
- *    Argon2id crypto_pwhash        — PIN -> vault key stretching
+ *  Primitives (all pure TypeScript / @noble):
+ *    Ed25519  @noble/curves/ed25519  — invitations, inbox authorization tokens
+ *    X25519   @noble/curves/ed25519  — ECDH for the ratchet (x25519 export)
+ *    BLAKE2b  @noble/hashes/blake2   — domain-separated KDF, fingerprints,
+ *                                      blinded inbox IDs
+ *    XChaCha20-Poly1305 @noble/ciphers/chacha — payload AEAD (24-byte nonce)
+ *    Argon2id @noble/hashes/argon2   — PIN -> vault key stretching
  *
- *  NOTE ON THE CIPHER: a 24-byte nonce is XChaCha20-Poly1305, not the IETF
- *  ChaCha20-Poly1305 construction (which takes 12 bytes). We deliberately use
- *  XChaCha so that nonces can be sampled at random forever without birthday
- *  risk — with 12 bytes, random nonces become unsafe around 2^32 messages
- *  per key, which a long-lived ratchet chain can plausibly approach.
- *
- *  RUNTIME: `libsodium-wrappers` runs as WASM/asm.js and needs a working
- *  `crypto.getRandomValues`. On React Native install `react-native-get-random-values`
- *  as the first import of your entrypoint, or swap this module's `sodium`
- *  binding for `react-native-libsodium` (API-compatible for everything used
- *  here) to get native performance and to keep key material out of the JS heap.
+ *  NOTE ON SUBPATH IMPORTS:
+ *  @noble/hashes v2 exports map specifies './blake2.js' (containing blake2b)
+ *  and './argon2.js' (containing argon2id), while @noble/curves and
+ *  @noble/ciphers export './ed25519.js' and './chacha.js'.
  * ============================================================================
  */
 
-import _sodium from 'libsodium-wrappers';
+// @noble v2 exports map requires explicit '.js' subpaths (e.g. './ed25519.js', './blake2.js', './argon2.js', './chacha.js')
+import { ed25519, x25519 } from '@noble/curves/ed25519.js';
+import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
+import { blake2b } from '@noble/hashes/blake2.js';
+import { argon2id } from '@noble/hashes/argon2.js';
 
-type Sodium = typeof _sodium;
-let sodium: Sodium;
-
-/** Must be awaited exactly once, before any other export is touched. */
+/**
+ * Kept for interface compatibility with App.tsx and callers.
+ * Pure TypeScript @noble libraries are synchronous and require no WASM readiness.
+ */
 export async function initCrypto(): Promise<void> {
-  if (sodium) return;
-  await _sodium.ready;
-  sodium = _sodium;
-}
-
-function requireReady(): Sodium {
-  if (!sodium) {
-    throw new Error('[veil/crypto] initCrypto() must be awaited before use.');
-  }
-  return sodium;
+  return Promise.resolve();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -88,31 +76,133 @@ export const maskPath = (index: number): string => `m/veil/mask/${index}`;
 export const MASK_INDEX = { PERSONAL: 0, GHOST: 1 } as const;
 
 /* -------------------------------------------------------------------------- */
-/* Byte utilities                                                             */
+/* Byte utilities (Pure TypeScript — no Buffer / atob / btoa)                  */
 /* -------------------------------------------------------------------------- */
 
-export const randomBytes = (n: number): Uint8Array => requireReady().randombytes_buf(n);
+/** CSPRNG using standard crypto.getRandomValues (polyfilled in index.js). */
+export const randomBytes = (n: number): Uint8Array => {
+  const b = new Uint8Array(n);
+  crypto.getRandomValues(b);
+  return b;
+};
 
-export const toB64 = (b: Uint8Array): string =>
-  requireReady().to_base64(b, _sodium.base64_variants.URLSAFE_NO_PADDING);
+const B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+const B64_LOOKUP = new Uint8Array(256);
+for (let i = 0; i < B64_CHARS.length; i++) {
+  B64_LOOKUP[B64_CHARS.charCodeAt(i)] = i;
+}
+// Robustness: also accept standard '+' and '/'
+B64_LOOKUP['+'.charCodeAt(0)] = 62;
+B64_LOOKUP['/'.charCodeAt(0)] = 63;
 
-export const fromB64 = (s: string): Uint8Array =>
-  requireReady().from_base64(s, _sodium.base64_variants.URLSAFE_NO_PADDING);
+/** Hand-rolled Base64URL encoding without padding over Uint8Array. */
+export function toB64(bytes: Uint8Array): string {
+  let out = '';
+  const len = bytes.length;
+  let i = 0;
+  for (; i + 2 < len; i += 3) {
+    const b0 = bytes[i];
+    const b1 = bytes[i + 1];
+    const b2 = bytes[i + 2];
+    out += B64_CHARS[b0 >> 2];
+    out += B64_CHARS[((b0 & 3) << 4) | (b1 >> 4)];
+    out += B64_CHARS[((b1 & 15) << 2) | (b2 >> 6)];
+    out += B64_CHARS[b2 & 63];
+  }
+  if (i < len) {
+    const b0 = bytes[i];
+    out += B64_CHARS[b0 >> 2];
+    if (i + 1 < len) {
+      const b1 = bytes[i + 1];
+      out += B64_CHARS[((b0 & 3) << 4) | (b1 >> 4)];
+      out += B64_CHARS[(b1 & 15) << 2];
+    } else {
+      out += B64_CHARS[(b0 & 3) << 4];
+    }
+  }
+  return out;
+}
 
-export const toHex = (b: Uint8Array): string => requireReady().to_hex(b);
-export const fromHex = (s: string): Uint8Array => requireReady().from_hex(s);
-const utf8 = (s: string): Uint8Array => requireReady().from_string(s);
-const fromUtf8 = (b: Uint8Array): string => requireReady().to_string(b);
+/** Hand-rolled Base64URL decoding without padding over Uint8Array. */
+export function fromB64(s: string): Uint8Array {
+  let str = s;
+  while (str.endsWith('=')) {
+    str = str.slice(0, -1);
+  }
+  const len = str.length;
+  if (len === 0) return new Uint8Array(0);
+
+  const mod = len % 4;
+  if (mod === 1) {
+    throw new Error('[veil/crypto] invalid base64 string length');
+  }
+
+  const outLen = Math.floor((len * 3) / 4);
+  const out = new Uint8Array(outLen);
+
+  let inIdx = 0;
+  let outIdx = 0;
+
+  while (inIdx < len) {
+    const c0 = str.charCodeAt(inIdx++);
+    const c1 = inIdx < len ? str.charCodeAt(inIdx++) : 65; // 'A' -> 0
+    const c2 = inIdx < len ? str.charCodeAt(inIdx++) : 65;
+    const c3 = inIdx < len ? str.charCodeAt(inIdx++) : 65;
+
+    const v0 = B64_LOOKUP[c0];
+    const v1 = B64_LOOKUP[c1];
+    const v2 = B64_LOOKUP[c2];
+    const v3 = B64_LOOKUP[c3];
+
+    const triple = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+
+    if (outIdx < outLen) out[outIdx++] = (triple >> 16) & 255;
+    if (outIdx < outLen) out[outIdx++] = (triple >> 8) & 255;
+    if (outIdx < outLen) out[outIdx++] = triple & 255;
+  }
+
+  return out;
+}
+
+const HEX_CHARS = '0123456789abcdef';
+
+export function toHex(bytes: Uint8Array): string {
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    out += HEX_CHARS[b >> 4] + HEX_CHARS[b & 15];
+  }
+  return out;
+}
+
+export function fromHex(hex: string): Uint8Array {
+  if (hex.length % 2 !== 0) {
+    throw new Error('[veil/crypto] hex string must have even length');
+  }
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    const val = parseInt(hex.slice(i, i + 2), 16);
+    if (Number.isNaN(val)) {
+      throw new Error('[veil/crypto] invalid hex character');
+    }
+    out[i / 2] = val;
+  }
+  return out;
+}
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const utf8 = (s: string): Uint8Array => encoder.encode(s);
+const fromUtf8 = (b: Uint8Array): string => decoder.decode(b);
 
 /** Constant-time equality. Never use `===` on secrets or MACs. */
 export function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
-  const s = requireReady();
   if (a.length !== b.length) return false;
-  try {
-    return s.memcmp(a, b);
-  } catch {
-    return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a[i] ^ b[i];
   }
+  return diff === 0;
 }
 
 /**
@@ -122,7 +212,7 @@ export function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
  */
 export function wipe(...buffers: (Uint8Array | undefined | null)[]): void {
   for (const b of buffers) {
-    if (b && b.length) requireReady().memzero(b);
+    if (b && b.length) b.fill(0);
   }
 }
 
@@ -143,21 +233,15 @@ const concat = (...parts: Uint8Array[]): Uint8Array => {
 
 /**
  * Keyed BLAKE2b as a KDF: subkey = BLAKE2b(msg = label, key = parentSeed).
- *
- * Chosen over `crypto_kdf_derive_from_key` because that API restricts the
- * context to 8 bytes and the subkey selector to a u64, which cannot express
- * readable hierarchical paths like `m/veil/mask/3/x25519.exchange`. Keyed
- * BLAKE2b with a full-length unique label is an accepted KDF construction and
- * gives us unlimited, self-documenting domain separation.
+ * Full-length unique label gives unlimited, self-documenting domain separation.
  */
 export function deriveSubSeed(
   parentSeed: Uint8Array,
   label: string,
   outLen: number = CRYPTO.SUBKEY_BYTES,
 ): Uint8Array {
-  const s = requireReady();
   if (parentSeed.length < 16) throw new Error('[veil/crypto] parent seed too short.');
-  return s.crypto_generichash(outLen, utf8(label), parentSeed);
+  return blake2b(utf8(label), { dkLen: outLen, key: parentSeed });
 }
 
 /** 256-bit master seed. This is the entire backup surface of an identity. */
@@ -186,7 +270,6 @@ export interface MaskIdentity {
  * how multi-device works without a server-side directory.
  */
 export function deriveMask(masterSeed: Uint8Array, index: number): MaskIdentity {
-  const s = requireReady();
   if (!Number.isInteger(index) || index < 0) {
     throw new Error('[veil/crypto] mask index must be a non-negative integer.');
   }
@@ -196,8 +279,11 @@ export function deriveMask(masterSeed: Uint8Array, index: number): MaskIdentity 
   const edSeed = deriveSubSeed(branch, LBL.identity);
   const xSeed = deriveSubSeed(branch, LBL.exchange);
 
-  const sign = s.crypto_sign_seed_keypair(edSeed);
-  const dh = s.crypto_kx_seed_keypair(xSeed);
+  const sign = ed25519.keygen(edSeed);
+  const dh = x25519.keygen(xSeed);
+
+  const signSk = new Uint8Array(sign.secretKey);
+  const dhSk = new Uint8Array(dh.secretKey);
 
   wipe(branch, edSeed, xSeed);
 
@@ -205,9 +291,9 @@ export function deriveMask(masterSeed: Uint8Array, index: number): MaskIdentity 
     index,
     path,
     signPk: sign.publicKey,
-    signSk: sign.privateKey,
+    signSk,
     dhPk: dh.publicKey,
-    dhSk: dh.privateKey,
+    dhSk,
     fingerprint: computeFingerprint(sign.publicKey, dh.publicKey),
   };
 }
@@ -246,12 +332,10 @@ function crockford(bytes: Uint8Array): string {
  * a user reads out loud stays unchanged.
  */
 export function computeFingerprint(signPk: Uint8Array, dhPk: Uint8Array): string {
-  const s = requireReady();
-  const digest = s.crypto_generichash(
-    CRYPTO.FINGERPRINT_BYTES,
-    concat(signPk, dhPk),
-    utf8(LBL.fingerprint).slice(0, 32),
-  );
+  const digest = blake2b(concat(signPk, dhPk), {
+    dkLen: CRYPTO.FINGERPRINT_BYTES,
+    key: utf8(LBL.fingerprint).slice(0, 32),
+  });
   return (crockford(digest).match(/.{1,4}/g) ?? []).join(' ');
 }
 
@@ -268,29 +352,19 @@ export interface SealedPayload {
 
 /**
  * Encrypts with a fresh random 24-byte nonce.
- *
- * `aad` is authenticated but not encrypted. Veil always binds the retention
- * mode, the message counter and the sender fingerprint into the AAD, so a
- * relay cannot downgrade a View-Once message to Persistent by flipping a
- * cleartext header byte — the tag would fail.
+ * Wire format: nonce(24) || ciphertext || tag(16).
  */
 export function aeadEncrypt(
   key: Uint8Array,
   plaintext: Uint8Array,
   aad?: Uint8Array,
 ): SealedPayload {
-  const s = requireReady();
   if (key.length !== CRYPTO.AEAD_KEY_BYTES) {
     throw new Error('[veil/crypto] AEAD key must be 32 bytes.');
   }
   const nonce = randomBytes(CRYPTO.NONCE_BYTES);
-  const ciphertext = s.crypto_aead_xchacha20poly1305_ietf_encrypt(
-    plaintext,
-    aad ?? null,
-    null, // nsec — unused by this construction
-    nonce,
-    key,
-  );
+  const cipher = xchacha20poly1305(key, nonce, aad);
+  const ciphertext = cipher.encrypt(plaintext);
   return { nonce, ciphertext };
 }
 
@@ -300,21 +374,14 @@ export function aeadDecrypt(
   sealed: SealedPayload,
   aad?: Uint8Array,
 ): Uint8Array | null {
-  const s = requireReady();
   if (key.length !== CRYPTO.AEAD_KEY_BYTES) return null;
   if (sealed.nonce.length !== CRYPTO.NONCE_BYTES) return null;
   if (sealed.ciphertext.length < CRYPTO.TAG_BYTES) return null;
   try {
-    return s.crypto_aead_xchacha20poly1305_ietf_decrypt(
-      null,
-      sealed.ciphertext,
-      aad ?? null,
-      sealed.nonce,
-      key,
-    );
+    const cipher = xchacha20poly1305(key, sealed.nonce, aad);
+    return cipher.decrypt(sealed.ciphertext);
   } catch {
-    // Forged tag, wrong key, or truncated frame — all indistinguishable here,
-    // which is exactly what we want to surface to the caller.
+    // Forged tag, wrong key, or truncated frame returns null
     return null;
   }
 }
@@ -379,9 +446,11 @@ export function dhRatchet(
   ourDhSk: Uint8Array,
   theirDhPk: Uint8Array,
 ): { rootKey: Uint8Array; chainKey: Uint8Array } {
-  const s = requireReady();
-  const shared = s.crypto_scalarmult(ourDhSk, theirDhPk);
-  const mixed = s.crypto_generichash(64, concat(rootKey, shared), utf8(LBL.exchange).slice(0, 32));
+  const shared = x25519.getSharedSecret(ourDhSk, theirDhPk);
+  const mixed = blake2b(concat(rootKey, shared), {
+    dkLen: 64,
+    key: utf8(LBL.exchange).slice(0, 32),
+  });
   wipe(shared);
   const next = { rootKey: mixed.slice(0, 32), chainKey: mixed.slice(32, 64) };
   wipe(mixed);
@@ -397,18 +466,18 @@ export const epochHour = (nowMs: number = Date.now()): number => Math.floor(nowM
 /**
  * blinded_inbox_id = BLAKE2b(msg = "label|epochHour", key = receivingRatchetPk)
  *
- * The relay only ever sees this rotating opaque string. Because the key is the
- * *current receiving ratchet* public key and the message includes the hour, the
- * address changes both when the ratchet steps and every hour — so a relay
- * cannot link two subscriptions across epochs, and a compromised relay log from
- * yesterday reveals nothing about today's routing.
+ * The relay only ever sees this rotating opaque string.
  */
 export function blindedInboxId(
   receivingRatchetPk: Uint8Array,
   hour: number = epochHour(),
 ): string {
-  const s = requireReady();
-  return toB64(s.crypto_generichash(32, utf8(`${LBL.inbox}|${hour}`), receivingRatchetPk));
+  return toB64(
+    blake2b(utf8(`${LBL.inbox}|${hour}`), {
+      dkLen: 32,
+      key: receivingRatchetPk,
+    }),
+  );
 }
 
 /**
@@ -430,11 +499,10 @@ export function signInboxAuth(
   inboxId: string,
   serverNonce: Uint8Array,
 ): { signPk: string; signature: string } {
-  const s = requireReady();
   const msg = concat(utf8(`veil.inbox.auth.v1|${inboxId}|`), serverNonce);
   return {
     signPk: toB64(mask.signPk),
-    signature: toB64(s.crypto_sign_detached(msg, mask.signSk)),
+    signature: toB64(ed25519.sign(msg, mask.signSk)),
   };
 }
 
@@ -463,9 +531,7 @@ export interface ParsedInvite extends VeilInvite {
 }
 
 /**
- * Canonical signing preimage. Sorted, fixed-order, explicitly delimited — a
- * signature over a URL string with arbitrary parameter order is a classic
- * malleability bug.
+ * Canonical signing preimage. Sorted, fixed-order, explicitly delimited.
  */
 function inviteCanonical(i: VeilInvite): Uint8Array {
   const canonical = [
@@ -484,8 +550,7 @@ export function createInvite(
   mask: MaskIdentity,
   opts: { ttlSeconds?: number; nick?: string } = {},
 ): { uri: string; rendezvous: Uint8Array; expiresAt: number } {
-  const s = requireReady();
-  const ttl = opts.ttlSeconds ?? 3600; // one hour; QR codes leak when they linger
+  const ttl = opts.ttlSeconds ?? 3600; // one hour
   const invite: VeilInvite = {
     v: 1,
     ik: mask.signPk,
@@ -495,7 +560,7 @@ export function createInvite(
     nick: opts.nick,
   };
 
-  const sig = s.crypto_sign_detached(inviteCanonical(invite), mask.signSk);
+  const sig = ed25519.sign(inviteCanonical(invite), mask.signSk);
 
   const q = new URLSearchParams({
     v: String(invite.v),
@@ -516,11 +581,9 @@ export function createInvite(
 
 /**
  * Parses and fully verifies an invitation. Returns null for anything
- * malformed, unsigned, mis-signed, or expired — the caller must not attempt
- * partial recovery, because a half-valid invite is an attacker-controlled one.
+ * malformed, unsigned, mis-signed, or expired.
  */
 export function parseInvite(uri: string): ParsedInvite | null {
-  const s = requireReady();
   try {
     if (!uri.startsWith('veil://invite?')) return null;
     const q = new URLSearchParams(uri.slice('veil://invite?'.length));
@@ -542,7 +605,7 @@ export function parseInvite(uri: string): ParsedInvite | null {
     if (invite.rz.length !== CRYPTO.RENDEZVOUS_BYTES) return null;
     if (!Number.isFinite(invite.exp)) return null;
 
-    const ok = s.crypto_sign_verify_detached(fromB64(sigRaw), inviteCanonical(invite), invite.ik);
+    const ok = ed25519.verify(fromB64(sigRaw), inviteCanonical(invite), invite.ik);
     if (!ok) return null;
     if (invite.exp * 1000 < Date.now()) return null;
 
@@ -550,7 +613,10 @@ export function parseInvite(uri: string): ParsedInvite | null {
       ...invite,
       fingerprint: computeFingerprint(invite.ik, invite.xk),
       rendezvousInbox: blindedInboxId(
-        s.crypto_generichash(32, invite.rz, utf8(LBL.inbox).slice(0, 32)),
+        blake2b(invite.rz, {
+          dkLen: 32,
+          key: utf8(LBL.inbox).slice(0, 32),
+        }),
       ),
     };
   } catch {
@@ -563,12 +629,16 @@ export function parseInvite(uri: string): ParsedInvite | null {
 /* -------------------------------------------------------------------------- */
 
 /**
+ * Argon2id cost parameters for deriveVaultKey.
+ * NOTE: The measured performance cost under Hermes is unverified until profiled on-device.
+ */
+export const VAULT_KDF_ITERATIONS = 3;
+export const VAULT_KDF_MEMORY_KIB = 64 * 1024; // 64 MiB
+export const VAULT_KDF_PARALLELISM = 1;
+export const VAULT_KDF_DKLEN = 32;
+
+/**
  * PIN -> 256-bit SQLCipher raw key via Argon2id.
- *
- * MODERATE limits (~256 MiB, ~0.7s) are intentional: a 6-digit PIN has ~20
- * bits of entropy, so the *only* thing standing between an imaged device and
- * the plaintext vault is the cost of this function. Do not lower it to make
- * unlock feel snappier; raise the PIN length instead.
  *
  * `partitionLabel` differs per partition ('primary' | 'decoy') so the same PIN
  * cannot possibly derive both keys.
@@ -578,23 +648,20 @@ export function deriveVaultKey(
   deviceSalt: Uint8Array,
   partitionLabel: string,
 ): Uint8Array {
-  const s = requireReady();
   if (deviceSalt.length !== CRYPTO.VAULT_SALT_BYTES) {
     throw new Error('[veil/crypto] device salt must be 16 bytes.');
   }
-  const salt = s.crypto_generichash(
-    CRYPTO.VAULT_SALT_BYTES,
-    utf8(`${LBL.vaultSalt}|${partitionLabel}`),
-    deviceSalt,
-  );
-  return s.crypto_pwhash(
-    CRYPTO.VAULT_KEY_BYTES,
-    pin,
-    salt,
-    s.crypto_pwhash_OPSLIMIT_MODERATE,
-    s.crypto_pwhash_MEMLIMIT_MODERATE,
-    s.crypto_pwhash_ALG_ARGON2ID13,
-  );
+  const salt = blake2b(utf8(`${LBL.vaultSalt}|${partitionLabel}`), {
+    dkLen: CRYPTO.VAULT_SALT_BYTES,
+    key: deviceSalt,
+  });
+  return argon2id(pin, salt, {
+    t: VAULT_KDF_ITERATIONS,
+    m: VAULT_KDF_MEMORY_KIB,
+    p: VAULT_KDF_PARALLELISM,
+    dkLen: VAULT_KDF_DKLEN,
+    maxmem: VAULT_KDF_MEMORY_KIB * 1024,
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -612,7 +679,6 @@ export function watermarkTag(input: {
   recipientFingerprint: string;
   minuteUtc: number;
 }): Uint8Array {
-  const s = requireReady();
   const msg = utf8(
     [
       LBL.watermark,
@@ -622,7 +688,7 @@ export function watermarkTag(input: {
       String(input.minuteUtc),
     ].join('|'),
   );
-  return s.crypto_generichash(32, msg, null);
+  return blake2b(msg, { dkLen: 32 });
 }
 
 export default {
@@ -653,4 +719,9 @@ export default {
   toB64,
   fromB64,
   toHex,
+  fromHex,
+  VAULT_KDF_ITERATIONS,
+  VAULT_KDF_MEMORY_KIB,
+  VAULT_KDF_PARALLELISM,
+  VAULT_KDF_DKLEN,
 };
